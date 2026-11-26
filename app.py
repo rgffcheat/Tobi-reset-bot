@@ -17,12 +17,12 @@ log = logging.getLogger("resetbot")
 # ------------------------------------------------------------------ config
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8586614111:AAGMfrWdT_u_tzjSsGbHmHlSAcNHyvJs5ak")
 ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS", "6739795427"))}
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "Reset@6739")
+ADMIN_USER = os.getenv("ADMIN_USER", "RGCHEAT")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "909090")
 SECRET_KEY = os.getenv("SECRET_KEY", "k9f2c7a1e84b3d6059a7c21f8e4b6d03")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 PORT = int(os.getenv("PORT", "10000"))
-BRAND = os.getenv("BRAND", "DRIP CLIENT RESET SYSTEM")
+BRAND = os.getenv("BRAND", "TOBI X RESET SYSTEM")
 try:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kolkata"))
@@ -424,7 +424,7 @@ app.secret_key = SECRET_KEY
 app.jinja_env.filters["ts"] = fmt_ts
 
 BASE = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{{title}} · Reset Admin</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{{title}} · TOBI X RESET Admin</title>
 <style>
 :root{--bg:#0b0d10;--card:#12161b;--bd:#222a33;--tx:#e6edf3;--mu:#8b98a5;--g:#22e07a;--r:#ff5d5d;--y:#ffc857}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
@@ -442,7 +442,7 @@ label{color:var(--mu);font-size:12px;display:block;margin-bottom:4px}.ok{color:v
 .flash{padding:10px 14px;border-radius:8px;margin-bottom:12px;background:#10261a;border:1px solid #1d5a38}.flash.e{background:#2a1313;border-color:#6b2222}
 .pill{padding:2px 8px;border-radius:99px;font-size:12px;background:#1b222a}.scroll{overflow-x:auto}code{color:var(--y)}
 </style></head><body>
-{% if session.get('admin') %}<div class="top"><b>⚡ RESET ADMIN</b>
+{% if session.get('admin') %}<div class="top"><b>⚡ TOBI X RESET ADMIN</b>
 <a href="/" class="{{'on' if tab=='d'}}">Dashboard</a><a href="/users" class="{{'on' if tab=='u'}}">Users</a>
 <a href="/api" class="{{'on' if tab=='a'}}">API Settings</a><a href="/limits" class="{{'on' if tab=='l'}}">Limits</a>
 <a href="/logs" class="{{'on' if tab=='g'}}">Logs</a><span class="sp"></span><a href="/logout">Logout</a></div>{% endif %}
