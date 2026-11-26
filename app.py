@@ -1,4 +1,5 @@
 import os, re, time, json, sqlite3, threading, secrets, html, logging
+from collections import deque
 from datetime import datetime
 import requests
 import telebot
@@ -77,6 +78,10 @@ def init_db():
             enabled INTEGER DEFAULT 1, status TEXT DEFAULT 'unknown', info TEXT DEFAULT '',
             checked INTEGER DEFAULT 0, used INTEGER DEFAULT 0);
         """)
+        try:  # reseller ownership of API accounts (older DBs don't have the column)
+            _db.execute("ALTER TABLE api_accounts ADD COLUMN owner_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
         _db.commit()
 
 
@@ -165,26 +170,49 @@ def mask(t):
     return (t[:8] + "…" + t[-4:]) if len(t) > 14 else ("•••" if t else "")
 
 
+def clean_token(t):
+    """Removes spaces / newlines / quotes / zero-width chars and a leading 'Bearer' that people
+    often paste together with the token (this alone makes a token fail with INVALID_API_KEY)."""
+    t = re.sub(r"[\u200b-\u200f\u2060\ufeff\s]+", "", t or "")
+    t = t.strip("'\"`")
+    if t.lower().startswith("bearer"):
+        t = t[6:].lstrip(":=")
+    return t.strip("'\"`")
+
+
 def _one_reset(base, token, verify, key):
     """returns (status, message) status in success|invalid|failed|busy|api_error"""
-    try:
-        r = requests.post(base + "/api/seller/reset-hwid", json={"license_key": key},
-                          headers={"Authorization": "Bearer " + token,
-                                   "Content-Type": "application/json"},
-                          timeout=20, verify=verify)
-    except requests.RequestException as e:
-        log.warning("reset request error: %s", e)
-        return "busy", "Could not reach the reset server"
+    token = clean_token(token)
+    r = None
+    for attempt in range(2):
+        try:
+            r = requests.post(base + "/api/seller/reset-hwid", json={"license_key": key},
+                              headers={"Authorization": "Bearer " + token,
+                                       "Content-Type": "application/json"},
+                              timeout=20, verify=verify)
+        except requests.RequestException as e:
+            log.warning("reset request error: %s", e)
+            if attempt == 0:
+                time.sleep(1.5)
+                continue
+            return "busy", "Could not reach the reset server"
+        if r.status_code in (429, 502, 503, 504) and attempt == 0:
+            time.sleep(1.5)
+            continue
+        break
     try:
         data = r.json()
     except Exception:
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     if r.status_code == 200 and data.get("success"):
         return "success", str(data.get("message") or "Device reset")
     code = str(data.get("error") or "").upper()
     msg = str(data.get("message") or f"HTTP {r.status_code}")
-    if code in ("MISSING_API_KEY", "INVALID_API_KEY", "KEY_REVOKED", "ACCOUNT_DISABLED"):
-        return "api_error", f"{code}: {msg}"
+    if (code in ("MISSING_API_KEY", "INVALID_API_KEY", "KEY_REVOKED", "ACCOUNT_DISABLED")
+            or r.status_code == 401):
+        return "api_error", f"{code or 'UNAUTHORIZED'}: {msg}"
     if r.status_code == 429 or code == "RATE_LIMITED":
         return "busy", msg
     low = (code + " " + msg).lower()
@@ -194,16 +222,33 @@ def _one_reset(base, token, verify, key):
     return "failed", msg
 
 
-_notified = {}
+# ---- admin alerts: throttled so a broken token can never flood the admin chat
+_alert_last = {}
+_alert_lock = threading.Lock()
 
 
-def call_reset(key):
-    """Tries every enabled seller API account until one resets the key.
-    returns (status, message, account_name)"""
-    accs = accounts()
+def alert_admin(tag, text, every=1800):
+    with _alert_lock:
+        t = time.time()
+        if t - _alert_last.get(tag, 0) < every:
+            return
+        _alert_last[tag] = t
+    for adm in ADMIN_IDS:
+        try:
+            bot.send_message(adm, text)
+        except Exception:
+            pass
+
+
+def call_reset(key, uid=None):
+    """Tries every enabled seller API account until one resets the key (the requesting
+    reseller's own accounts first). returns (status, message, account_name, detail)"""
+    accs = list(accounts())
     gbase, verify = api_cfg()
     if not accs:
-        return "not_configured", "No seller API account added", ""
+        return "not_configured", "No seller API account added", "", ""
+    if uid is not None:
+        accs.sort(key=lambda a: 0 if a["owner_id"] == uid else 1)
     results = []
     for a in accs:
         base = (a["base_url"] or gbase or "").strip().rstrip("/")
@@ -211,26 +256,23 @@ def call_reset(key):
             continue
         st, msg = _one_reset(base, a["token"], verify, key)
         if st == "success":
-            q("UPDATE api_accounts SET used=used+1 WHERE id=?", (a["id"],), commit=True)
-            return "success", msg, a["name"]
+            q("UPDATE api_accounts SET used=used+1, status='connected' WHERE id=?", (a["id"],), commit=True)
+            return "success", msg, a["name"], ""
         if st == "api_error":
             q("UPDATE api_accounts SET status='failed', info=?, checked=? WHERE id=?",
               (msg[:200], now(), a["id"]), commit=True)
-            if now() - _notified.get(a["id"], 0) > 3600:
-                _notified[a["id"]] = now()
-                for adm in ADMIN_IDS:
-                    try:
-                        bot.send_message(adm, f"⚠️ API account <b>{esc(a['name'])}</b> problem: <code>{esc(msg)}</code>")
-                    except Exception:
-                        pass
+            alert_admin(f"acc{a['id']}",
+                        f"⚠️ API account <b>{esc(a['name'])}</b> problem: <code>{esc(msg)}</code>\n"
+                        "<i>(this alert repeats at most once every 30 min)</i>")
         results.append((st, msg, a["name"]))
+    detail = "; ".join(f"{n}={st}:{m[:70]}" for st, m, n in results)
     if not results:
-        return "not_configured", "API base URL not set", ""
+        return "not_configured", "API base URL not set", "", ""
     for want in ("failed", "invalid", "busy"):
         for st, msg, name in results:
             if st == want:
-                return st, msg, name
-    return "api_error", results[0][1], results[0][2]
+                return st, msg, name, detail
+    return "api_error", results[0][1], results[0][2], detail
 
 
 def test_account(a):
@@ -241,7 +283,7 @@ def test_account(a):
           (now(), a["id"]), commit=True)
         return False, "Base URL not set"
     try:
-        r = requests.get(base + "/api/seller/me", headers={"Authorization": "Bearer " + a["token"]},
+        r = requests.get(base + "/api/seller/me", headers={"Authorization": "Bearer " + clean_token(a["token"])},
                          timeout=20, verify=verify)
         data = r.json() if r.content else {}
     except Exception as e:
@@ -278,6 +320,21 @@ def migrate():
         if tok:
             q("INSERT INTO api_accounts(name,token,base_url,enabled,status,info,checked,used) VALUES(?,?,?,?,?,?,?,?)",
               ("Main", tok, "", 1, "unknown", "", 0, 0), commit=True)
+
+
+def seed_env_accounts():
+    """SELLER_TOKENS="Me:txr_aaa,Friend:txr_bbb" -> accounts that survive Render free-plan
+    restarts (its disk is wiped on every restart/redeploy)."""
+    raw = os.getenv("SELLER_TOKENS", "")
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, tok = item.split(":", 1) if ":" in item else ("Env", item)
+        tok = clean_token(tok)
+        if tok and not q("SELECT 1 FROM api_accounts WHERE token=?", (tok,), one=True):
+            q("INSERT INTO api_accounts(name,token,base_url,enabled,status,info,checked,used) VALUES(?,?,?,?,?,?,?,?)",
+              (name.strip()[:40] or "Env", tok, "", 1, "unknown", "", 0, 0), commit=True)
 
 
 def bot_token():
@@ -322,6 +379,44 @@ def start_text(row):
             f"└ /help — Instructions\n{LINE}")
 
 
+# ---- anti-spam gate: private chats only + max 10 messages/min per user
+_flood = {}
+_flood_lock = threading.Lock()
+MEDIA = ["text", "photo", "document", "sticker", "video", "audio", "voice", "animation",
+         "contact", "location", "video_note", "poll", "dice"]
+
+
+def _flood_count(uid):
+    t = time.time()
+    with _flood_lock:
+        dq = _flood.setdefault(uid, deque())
+        while dq and t - dq[0] > 60:
+            dq.popleft()
+        dq.append(t)
+        if len(_flood) > 5000:
+            for k in [k for k, v in _flood.items() if not v or t - v[-1] > 60]:
+                _flood.pop(k, None)
+        return len(dq)
+
+
+def _gate(m):
+    """True = swallow the message (handled by h_gate, which sends nothing / one warning)."""
+    if m.chat.type != "private" or m.from_user is None:
+        return True
+    if m.from_user.id in ADMIN_IDS:
+        return False
+    return _flood_count(m.from_user.id) > 10
+
+
+@bot.message_handler(func=_gate, content_types=MEDIA)
+def h_gate(m):
+    if m.chat.type == "private" and m.from_user and _flood_count(m.from_user.id) == 12:
+        try:
+            bot.send_message(m.chat.id, "🐢 Too many messages. Please slow down for a minute.")
+        except Exception:
+            pass
+
+
 @bot.message_handler(commands=["start"])
 def h_start(m):
     row = upsert_user(m.from_user)
@@ -339,7 +434,11 @@ def h_help(m):
                      "<b>Results:</b>\n"
                      "✅ Reset Successful\n❌ Invalid Key\n⛔ Limit Reached\n⚠️ Reset Not Successful\n\n"
                      "Limits use a rolling 24 hours — failed resets are <b>not</b> counted.\n"
-                     "Use /status to see your usage.")
+                     "Use /status to see your usage.\n\n"
+                     "🏷️ <b>Resellers:</b>\n"
+                     "/addtoken &lt;API_TOKEN&gt; [name] — add your seller API token\n"
+                     "/mytokens — list your tokens\n"
+                     "/deltoken &lt;id&gt; — remove a token")
 
 
 @bot.message_handler(commands=["status"])
@@ -421,6 +520,66 @@ def h_admin_cmds(m):
     bot.reply_to(m, "✅ Updated user <code>%d</code>" % uid)
 
 
+# ---- reseller: manage own seller API tokens from Telegram
+def _can_add_token(row):
+    return row["tier"] == "reseller" or row["id"] in ADMIN_IDS
+
+
+@bot.message_handler(commands=["addtoken"])
+def h_addtoken(m):
+    row = upsert_user(m.from_user)
+    if row["banned"]:
+        return
+    try:  # remove the message so the token isn't left in the chat
+        bot.delete_message(m.chat.id, m.message_id)
+    except Exception:
+        pass
+    if not _can_add_token(row):
+        return bot.send_message(m.chat.id, "🏷️ Only Reseller accounts can add an API token. Contact admin.")
+    p = m.text.split(maxsplit=2)
+    if len(p) < 2:
+        return bot.send_message(m.chat.id, "Usage: /addtoken &lt;API_TOKEN&gt; [name]")
+    tok = clean_token(p[1])
+    name = (p[2].strip()[:40] if len(p) > 2 else "") or (m.from_user.first_name or "Reseller")
+    if len(tok) < 10:
+        return bot.send_message(m.chat.id, "❌ That token looks too short.")
+    if q("SELECT 1 FROM api_accounts WHERE token=?", (tok,), one=True):
+        return bot.send_message(m.chat.id, "ℹ️ This token is already added.")
+    if row["id"] not in ADMIN_IDS and q("SELECT COUNT(*) c FROM api_accounts WHERE owner_id=?", (row["id"],), one=True)["c"] >= 5:
+        return bot.send_message(m.chat.id, "⛔ Max 5 tokens per reseller. Use /deltoken first.")
+    q("INSERT INTO api_accounts(name,token,base_url,enabled,status,info,checked,used,owner_id) VALUES(?,?,?,?,?,?,?,?,?)",
+      (name, tok, "", 1, "unknown", "", 0, 0, row["id"]), commit=True)
+    a = q("SELECT * FROM api_accounts ORDER BY id DESC LIMIT 1", one=True)
+    ok, info = test_account(a)
+    if not ok:
+        q("DELETE FROM api_accounts WHERE id=?", (a["id"],), commit=True)
+        return bot.send_message(m.chat.id, f"❌ Token rejected, not saved.\n<code>{esc(info)}</code>")
+    bot.send_message(m.chat.id, f"✅ Token added (<b>{esc(name)}</b>) — {esc(info)}\nYour keys are now reset with your own token first.")
+
+
+@bot.message_handler(commands=["mytokens"])
+def h_mytokens(m):
+    row = upsert_user(m.from_user)
+    rows = q("SELECT * FROM api_accounts WHERE owner_id=? ORDER BY id", (row["id"],))
+    if not rows:
+        return bot.reply_to(m, "You have no tokens. Use /addtoken &lt;API_TOKEN&gt;")
+    bot.reply_to(m, "🔑 <b>Your tokens</b>\n" + "\n".join(
+        f"#{a['id']} {esc(a['name'])} — {a['status']} — resets: {a['used']}" for a in rows))
+
+
+@bot.message_handler(commands=["deltoken"])
+def h_deltoken(m):
+    row = upsert_user(m.from_user)
+    p = m.text.split()
+    if len(p) < 2 or not p[1].isdigit():
+        return bot.reply_to(m, "Usage: /deltoken &lt;id&gt; (see /mytokens)")
+    a = q("SELECT * FROM api_accounts WHERE id=?", (int(p[1]),), one=True)
+    if not a or (a["owner_id"] != row["id"] and row["id"] not in ADMIN_IDS):
+        return bot.reply_to(m, "Token not found.")
+    q("DELETE FROM api_accounts WHERE id=?", (a["id"],), commit=True)
+    bot.reply_to(m, "🗑 Token removed.")
+
+
 # ---- key handler
 @bot.message_handler(func=lambda m: bool(m.text) and not m.text.startswith("/"), content_types=["text"])
 def h_key(m):
@@ -445,9 +604,9 @@ def h_key(m):
         _inflight.add(uid)
     try:
         wait = bot.reply_to(m, "⏳ <b>Processing...</b>")
-        status, msg, acct = call_reset(key)
+        status, msg, acct, detail = call_reset(key, uid)
         q("INSERT INTO resets(user_id,license_key,status,message,ts) VALUES(?,?,?,?,?)",
-          (uid, key, status, (msg[:260] + (f" [via {acct}]" if acct else "")), now()), commit=True)
+          (uid, key, status, ((msg[:200] + (f" [via {acct}]" if acct else "") + (f" | {detail}" if detail else ""))[:480]), now()), commit=True)
         if status == "success":
             used += 1
             left = "Unlimited" if lim < 0 else str(max(0, lim - used))
@@ -467,15 +626,14 @@ def h_key(m):
         elif status in ("api_error", "not_configured"):
             text = (f"{LINE}\n🔧 <b>SERVICE UNAVAILABLE</b>\n{LINE}\n\n"
                     "Reset service is temporarily offline. Please contact admin.")
-            for a in ADMIN_IDS:
-                try:
-                    bot.send_message(a, f"⚠️ Reset API problem: <code>{esc(msg)}</code>")
-                except Exception:
-                    pass
+            alert_admin("svc", f"⚠️ Reset API problem: <code>{esc(msg)}</code>\n"
+                               "<i>(repeats at most once every 30 min)</i>")
         else:
             text = (f"{LINE}\n⚠️ <b>RESET NOT SUCCESSFUL</b>\n{LINE}\n\n"
                     f"🔑 <code>{esc(key)}</code>\n"
                     f"Reason: {esc(msg)}\n<i>This attempt was not counted.</i>")
+        if uid in ADMIN_IDS and detail:
+            text += f"\n\n🛠 <b>Admin debug</b>\n<code>{esc(detail)}</code>"
         try:
             bot.edit_message_text(text, m.chat.id, wait.message_id)
         except Exception:
@@ -695,7 +853,7 @@ def api_settings():
     <p style="color:var(--mu);margin-top:0">A key sent by a user is tried on <b>every enabled account</b> until one resets it —
     so keys made by you, your friend, or any other seller all work as long as their token is added here.</p>
     <div class="scroll"><table><tr><th>Name</th><th>Token</th><th>Status</th><th>Resets</th><th></th></tr>
-    {% for a in accs %}<tr><td><b>{{a.name}}</b>{% if a.base_url %}<br><small style="color:var(--mu)">{{a.base_url}}</small>{% endif %}</td>
+    {% for a in accs %}<tr><td><b>{{a.name}}</b>{% if a.owner_id %}<br><small style="color:var(--y)">👤 reseller {{a.owner_id}}</small>{% endif %}{% if a.base_url %}<br><small style="color:var(--mu)">{{a.base_url}}</small>{% endif %}</td>
     <td><code>{{mask(a.token)}}</code></td>
     <td>{% if not a.enabled %}<span class="pill">disabled</span>{% elif a.status=='connected' %}<b class="ok">🟢 Connected</b>
     {% elif a.status=='failed' %}<b class="bad">🔴 Failed</b>{% else %}<span class="warn">⚪ Untested</span>{% endif %}
@@ -709,8 +867,15 @@ def api_settings():
     <form method="post" action="/api/account/add"><input type="hidden" name="_c" value="{{csrf()}}">
     <div class="row"><div><label>Name (e.g. My dashboard, Friend 1)</label><input type="text" name="name" required></div>
     <div><label>API Token</label><input type="password" name="token" placeholder="txr_..." required></div>
-    <div><label>Own Base URL (optional — blank = server above)</label><input type="text" name="base"></div></div>
+    <div><label>Own Base URL (optional — blank = server above)</label><input type="text" name="base"></div>
+    <div><label>Reseller Telegram ID (optional — owner of this token)</label><input type="number" name="owner"></div></div>
     <button class="btn">Add &amp; Test</button></form></div>
+
+    <div class="card"><h2>🧪 Debug: try a real reset with one account</h2>
+    <p style="color:var(--mu);margin-top:0">Shows the raw server answer (HTTP code + body) for the chosen account — use this to see exactly why a token fails. A valid key WILL be reset.</p>
+    <form method="post" action="/api/probe" class="s"><input type="hidden" name="_c" value="{{csrf()}}">
+    <select name="aid">{% for a in accs %}<option value="{{a.id}}">{{a.name}}</option>{% endfor %}</select>
+    <input type="text" name="key" placeholder="License key" required style="width:260px"> <button class="btn alt">Try</button></form></div>
 
     <div class="card"><h2>🤖 Telegram Bot Token</h2>
     <p>Current: <code>{{bmask}}</code> {% if buser %}<span class="pill">@{{buser}}</span>{% endif %}</p>
@@ -739,7 +904,7 @@ def api_server():
 @app.route("/api/account/add", methods=["POST"])
 def api_add():
     name = request.form.get("name", "").strip()[:40] or "Account"
-    tok = request.form.get("token", "").strip()
+    tok = clean_token(request.form.get("token", ""))
     base = request.form.get("base", "").strip().rstrip("/")
     base = re.split(r"/api(/|$)", base)[0]
     if base and not base.startswith("http"):
@@ -747,11 +912,34 @@ def api_add():
     if not tok:
         flash("Token required", "error")
         return redirect("/api")
-    q("INSERT INTO api_accounts(name,token,base_url,enabled,status,info,checked,used) VALUES(?,?,?,?,?,?,?,?)",
-      (name, tok, base, 1, "unknown", "", 0, 0), commit=True)
+    owner = _custom(request.form.get("owner"))
+    if owner:  # make the owner a reseller so they can also manage tokens from Telegram
+        q("INSERT OR IGNORE INTO users(id,joined_at,last_seen) VALUES(?,?,0)", (owner, now()), commit=True)
+        q("UPDATE users SET tier='reseller' WHERE id=? AND tier IN ('standard','basic')", (owner,), commit=True)
+    q("INSERT INTO api_accounts(name,token,base_url,enabled,status,info,checked,used,owner_id) VALUES(?,?,?,?,?,?,?,?,?)",
+      (name, tok, base, 1, "unknown", "", 0, 0, owner), commit=True)
     a = q("SELECT * FROM api_accounts ORDER BY id DESC LIMIT 1", one=True)
     ok, info = test_account(a)
     flash(("✅ Connected — " if ok else "❌ Added but connection failed — ") + info, "ok" if ok else "error")
+    return redirect("/api")
+
+
+@app.route("/api/probe", methods=["POST"])
+def api_probe():
+    a = q("SELECT * FROM api_accounts WHERE id=?", (int(request.form.get("aid", "0") or 0),), one=True)
+    key = request.form.get("key", "").strip()
+    if not a or not key:
+        flash("Pick an account and enter a key", "error")
+        return redirect("/api")
+    gbase, verify = api_cfg()
+    base = (a["base_url"] or gbase or "").strip().rstrip("/")
+    try:
+        r = requests.post(base + "/api/seller/reset-hwid", json={"license_key": key},
+                          headers={"Authorization": "Bearer " + clean_token(a["token"]),
+                                   "Content-Type": "application/json"}, timeout=20, verify=verify)
+        flash(f"[{a['name']}] {base} → HTTP {r.status_code}: {r.text[:400]}", "ok" if r.status_code == 200 else "error")
+    except Exception as e:
+        flash(f"[{a['name']}] {base} → connection error: {e}", "error")
     return redirect("/api")
 
 
@@ -846,7 +1034,8 @@ def run_bot():
                 ev.clear()
             bot.remove_webhook()
             log.info("Bot polling started")
-            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30,
+                                 allowed_updates=["message"])
         except Exception as e:
             log.error("polling crashed: %s", e)
         time.sleep(3)
@@ -854,6 +1043,7 @@ def run_bot():
 
 init_db()
 migrate()
+seed_env_accounts()
 
 if __name__ == "__main__":
     if not bot_token():
