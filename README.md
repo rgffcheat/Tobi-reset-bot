@@ -19,3 +19,8 @@ Keep-alive pings /health every 4 minutes automatically.
 - Anti-spam: private chats only, 10 msgs/min per user, admin alerts at most once per 30 min.
 - Render free plan wipes bot.db on every restart. To keep tokens permanently set env var
   SELLER_TOKENS="Me:txr_xxx,Friend:txr_yyy"  (and BOT_TOKEN, ADMIN_PASS, SECRET_KEY as env vars too).
+
+## Auto-detect key owner
+Set the Base URL once (API Settings), then add each seller as name + token only.
+A key is checked against all seller tokens in parallel; the owner's token resets it (~1s),
+the winner is remembered for next time. If nobody owns it -> "Invalid key".

@@ -1,5 +1,6 @@
 import os, re, time, json, sqlite3, threading, secrets, html, logging
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import requests
 import telebot
@@ -73,6 +74,7 @@ def init_db():
             license_key TEXT, status TEXT, message TEXT, ts INTEGER);
         CREATE INDEX IF NOT EXISTS ix_resets_user_ts ON resets(user_id, ts);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS key_owner(license_key TEXT PRIMARY KEY, acc_id INTEGER, ts INTEGER);
         CREATE TABLE IF NOT EXISTS api_accounts(
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, token TEXT, base_url TEXT,
             enabled INTEGER DEFAULT 1, status TEXT DEFAULT 'unknown', info TEXT DEFAULT '',
@@ -216,6 +218,9 @@ def _one_reset(base, token, verify, key):
     if r.status_code == 429 or code == "RATE_LIMITED":
         return "busy", msg
     low = (code + " " + msg).lower()
+    if r.status_code == 403 or any(x in low for x in ("not your", "not owned", "belong", "forbidden",
+                                                       "permission", "another seller", "different seller")):
+        return "notmine", msg  # key exists but was made by another seller
     if r.status_code == 404 or any(x in low for x in ("not found", "not_found", "invalid_key",
                                                        "invalid key", "invalid_license", "no such")):
         return "invalid", msg
@@ -240,44 +245,87 @@ def alert_admin(tag, text, every=1800):
             pass
 
 
+def _base_for(a, gbase):
+    """ONE shared Base URL (API Settings) is used for every seller; a per-account URL is only a fallback."""
+    return (gbase or a["base_url"] or "").strip().rstrip("/")
+
+
 def call_reset(key, uid=None):
-    """Tries every enabled seller API account until one resets the key (the requesting
-    reseller's own accounts first). returns (status, message, account_name, detail)"""
+    """Finds whose key it is and resets it. The key is sent to EVERY enabled seller token at the
+    same time (the owner's token resets it, the others answer 'not found'); the first success wins,
+    so it takes about one request-time no matter how many sellers there are. The winning seller is
+    remembered, so the same key later goes straight to its owner.
+    returns (status, message, account_name, detail)"""
     accs = list(accounts())
     gbase, verify = api_cfg()
     if not accs:
         return "not_configured", "No seller API account added", "", ""
-    if uid is not None:
-        accs.sort(key=lambda a: 0 if a["owner_id"] == uid else 1)
-    results = []
-    for a in accs:
-        base = (a["base_url"] or gbase or "").strip().rstrip("/")
-        if not base:
-            continue
-        st, msg = _one_reset(base, a["token"], verify, key)
-        if st == "success":
-            q("UPDATE api_accounts SET used=used+1, status='connected' WHERE id=?", (a["id"],), commit=True)
-            return "success", msg, a["name"], ""
-        if st == "api_error":
-            q("UPDATE api_accounts SET status='failed', info=?, checked=? WHERE id=?",
-              (msg[:200], now(), a["id"]), commit=True)
-            alert_admin(f"acc{a['id']}",
-                        f"⚠️ API account <b>{esc(a['name'])}</b> problem: <code>{esc(msg)}</code>\n"
-                        "<i>(this alert repeats at most once every 30 min)</i>")
-        results.append((st, msg, a["name"]))
-    detail = "; ".join(f"{n}={st}:{m[:70]}" for st, m, n in results)
-    if not results:
+    accs = [a for a in accs if _base_for(a, gbase)]
+    if not accs:
         return "not_configured", "API base URL not set", "", ""
-    for want in ("failed", "invalid", "busy"):
+
+    def win(a, msg):
+        q("UPDATE api_accounts SET used=used+1, status='connected' WHERE id=?", (a["id"],), commit=True)
+        q("INSERT INTO key_owner(license_key,acc_id,ts) VALUES(?,?,?) ON CONFLICT(license_key) "
+          "DO UPDATE SET acc_id=excluded.acc_id, ts=excluded.ts", (key, a["id"], now()), commit=True)
+        return "success", msg, a["name"], ""
+
+    def bad_token(a, msg):
+        q("UPDATE api_accounts SET status='failed', info=?, checked=? WHERE id=?",
+          (msg[:200], now(), a["id"]), commit=True)
+        alert_admin(f"acc{a['id']}",
+                    f"⚠️ API account <b>{esc(a['name'])}</b> problem: <code>{esc(msg)}</code>\n"
+                    "<i>(this alert repeats at most once every 30 min)</i>")
+
+    # 1) known owner of this key -> straight to it
+    known = q("SELECT acc_id FROM key_owner WHERE license_key=?", (key,), one=True)
+    tried = set()
+    if known:
+        a = next((x for x in accs if x["id"] == known["acc_id"]), None)
+        if a:
+            tried.add(a["id"])
+            st, msg = _one_reset(_base_for(a, gbase), a["token"], verify, key)
+            if st == "success":
+                return win(a, msg)
+            if st == "api_error":
+                bad_token(a, msg)
+
+    # 2) everyone else, all at once
+    rest = [a for a in accs if a["id"] not in tried]
+    results = []
+    if rest:
+        ex = ThreadPoolExecutor(max_workers=min(len(rest), 16))
+        try:
+            futs = {ex.submit(_one_reset, _base_for(a, gbase), a["token"], verify, key): a for a in rest}
+            for f in as_completed(futs):
+                a = futs[f]
+                try:
+                    st, msg = f.result()
+                except Exception as e:
+                    st, msg = "busy", str(e)[:100]
+                if st == "success":
+                    return win(a, msg)
+                if st == "api_error":
+                    bad_token(a, msg)
+                results.append((st, msg, a["name"]))
+        finally:
+            ex.shutdown(wait=False)
+    detail = "; ".join(f"{n}={st}:{m[:70]}" for st, m, n in results)
+    # nobody could reset it: show the most useful reason
+    for want in ("failed", "busy"):
         for st, msg, name in results:
             if st == want:
                 return st, msg, name, detail
-    return "api_error", results[0][1], results[0][2], detail
+    if any(st in ("invalid", "notmine") for st, _, _ in results):
+        return "invalid", "Key not found in any seller account", "", detail
+    if results:
+        return "api_error", results[0][1], results[0][2], detail
+    return "api_error", "No working seller token", "", detail
 
 
 def test_account(a):
     gbase, verify = api_cfg()
-    base = (a["base_url"] or gbase or "").strip().rstrip("/")
+    base = _base_for(a, gbase)
     if not base:
         q("UPDATE api_accounts SET status='failed', info='Base URL not set', checked=? WHERE id=?",
           (now(), a["id"]), commit=True)
@@ -850,10 +898,11 @@ def api_settings():
     <button class="btn">Save &amp; Test all</button></form></div>
 
     <div class="card"><h2>🔑 Seller API accounts ({{accs|length}})</h2>
-    <p style="color:var(--mu);margin-top:0">A key sent by a user is tried on <b>every enabled account</b> until one resets it —
-    so keys made by you, your friend, or any other seller all work as long as their token is added here.</p>
+    <p style="color:var(--mu);margin-top:0">Set the Base URL once above, then just add each seller's <b>name + API token</b>.
+    When a user sends a key, the bot checks <b>all</b> seller tokens at the same time, finds whose key it is and resets it in ~1 second.
+    If nobody owns it, the user gets “Invalid key”.</p>
     <div class="scroll"><table><tr><th>Name</th><th>Token</th><th>Status</th><th>Resets</th><th></th></tr>
-    {% for a in accs %}<tr><td><b>{{a.name}}</b>{% if a.owner_id %}<br><small style="color:var(--y)">👤 reseller {{a.owner_id}}</small>{% endif %}{% if a.base_url %}<br><small style="color:var(--mu)">{{a.base_url}}</small>{% endif %}</td>
+    {% for a in accs %}<tr><td><b>{{a.name}}</b>{% if a.owner_id %}<br><small style="color:var(--y)">👤 reseller {{a.owner_id}}</small>{% endif %}</td>
     <td><code>{{mask(a.token)}}</code></td>
     <td>{% if not a.enabled %}<span class="pill">disabled</span>{% elif a.status=='connected' %}<b class="ok">🟢 Connected</b>
     {% elif a.status=='failed' %}<b class="bad">🔴 Failed</b>{% else %}<span class="warn">⚪ Untested</span>{% endif %}
@@ -865,10 +914,9 @@ def api_settings():
     </td></tr>{% endfor %}</table></div>
     <h2 style="margin-top:18px">➕ Add seller account</h2>
     <form method="post" action="/api/account/add"><input type="hidden" name="_c" value="{{csrf()}}">
-    <div class="row"><div><label>Name (e.g. My dashboard, Friend 1)</label><input type="text" name="name" required></div>
+    <div class="row"><div><label>Seller name (e.g. RG, RP, Friend 1)</label><input type="text" name="name" required></div>
     <div><label>API Token</label><input type="password" name="token" placeholder="txr_..." required></div>
-    <div><label>Own Base URL (optional — blank = server above)</label><input type="text" name="base"></div>
-    <div><label>Reseller Telegram ID (optional — owner of this token)</label><input type="number" name="owner"></div></div>
+    <div><label>Reseller Telegram ID (optional — lets them manage it from the bot)</label><input type="number" name="owner"></div></div>
     <button class="btn">Add &amp; Test</button></form></div>
 
     <div class="card"><h2>🧪 Debug: try a real reset with one account</h2>
@@ -932,7 +980,7 @@ def api_probe():
         flash("Pick an account and enter a key", "error")
         return redirect("/api")
     gbase, verify = api_cfg()
-    base = (a["base_url"] or gbase or "").strip().rstrip("/")
+    base = _base_for(a, gbase)
     try:
         r = requests.post(base + "/api/seller/reset-hwid", json={"license_key": key},
                           headers={"Authorization": "Bearer " + clean_token(a["token"]),
