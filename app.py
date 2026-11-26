@@ -72,6 +72,10 @@ def init_db():
             license_key TEXT, status TEXT, message TEXT, ts INTEGER);
         CREATE INDEX IF NOT EXISTS ix_resets_user_ts ON resets(user_id, ts);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS api_accounts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, token TEXT, base_url TEXT,
+            enabled INTEGER DEFAULT 1, status TEXT DEFAULT 'unknown', info TEXT DEFAULT '',
+            checked INTEGER DEFAULT 0, used INTEGER DEFAULT 0);
         """)
         _db.commit()
 
@@ -86,6 +90,9 @@ def get_setting(k):
 def set_setting(k, v):
     q("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
       (k, str(v)), commit=True)
+
+
+esc = html.escape
 
 
 def now():
@@ -144,21 +151,27 @@ def lim_txt(n):
 # ------------------------------------------------------------------ reset API
 def api_cfg():
     base = (get_setting("api_base_url") or "").strip().rstrip("/")
-    token = (get_setting("api_token") or "").strip()
     verify = get_setting("verify_ssl") == "1"
-    return base, token, verify
+    return base, verify
 
 
-def call_reset(key):
-    """returns (status, message) status in success|invalid|failed|busy|api_error|not_configured"""
-    base, token, verify = api_cfg()
-    if not base or not token:
-        return "not_configured", "API not configured"
+def accounts(enabled_only=True):
+    sql = "SELECT * FROM api_accounts" + (" WHERE enabled=1" if enabled_only else "") + " ORDER BY id"
+    return q(sql)
+
+
+def mask(t):
+    t = t or ""
+    return (t[:8] + "…" + t[-4:]) if len(t) > 14 else ("•••" if t else "")
+
+
+def _one_reset(base, token, verify, key):
+    """returns (status, message) status in success|invalid|failed|busy|api_error"""
     try:
         r = requests.post(base + "/api/seller/reset-hwid", json={"license_key": key},
                           headers={"Authorization": "Bearer " + token,
                                    "Content-Type": "application/json"},
-                          timeout=25, verify=verify)
+                          timeout=20, verify=verify)
     except requests.RequestException as e:
         log.warning("reset request error: %s", e)
         return "busy", "Could not reach the reset server"
@@ -181,24 +194,61 @@ def call_reset(key):
     return "failed", msg
 
 
-def test_api():
-    base, token, verify = api_cfg()
-    if not base or not token:
-        set_setting("api_status", "not_configured")
-        set_setting("api_info", "")
-        set_setting("api_checked", now())
-        return False, "Base URL and token are required"
+_notified = {}
+
+
+def call_reset(key):
+    """Tries every enabled seller API account until one resets the key.
+    returns (status, message, account_name)"""
+    accs = accounts()
+    gbase, verify = api_cfg()
+    if not accs:
+        return "not_configured", "No seller API account added", ""
+    results = []
+    for a in accs:
+        base = (a["base_url"] or gbase or "").strip().rstrip("/")
+        if not base:
+            continue
+        st, msg = _one_reset(base, a["token"], verify, key)
+        if st == "success":
+            q("UPDATE api_accounts SET used=used+1 WHERE id=?", (a["id"],), commit=True)
+            return "success", msg, a["name"]
+        if st == "api_error":
+            q("UPDATE api_accounts SET status='failed', info=?, checked=? WHERE id=?",
+              (msg[:200], now(), a["id"]), commit=True)
+            if now() - _notified.get(a["id"], 0) > 3600:
+                _notified[a["id"]] = now()
+                for adm in ADMIN_IDS:
+                    try:
+                        bot.send_message(adm, f"⚠️ API account <b>{esc(a['name'])}</b> problem: <code>{esc(msg)}</code>")
+                    except Exception:
+                        pass
+        results.append((st, msg, a["name"]))
+    if not results:
+        return "not_configured", "API base URL not set", ""
+    for want in ("failed", "invalid", "busy"):
+        for st, msg, name in results:
+            if st == want:
+                return st, msg, name
+    return "api_error", results[0][1], results[0][2]
+
+
+def test_account(a):
+    gbase, verify = api_cfg()
+    base = (a["base_url"] or gbase or "").strip().rstrip("/")
+    if not base:
+        q("UPDATE api_accounts SET status='failed', info='Base URL not set', checked=? WHERE id=?",
+          (now(), a["id"]), commit=True)
+        return False, "Base URL not set"
     try:
-        r = requests.get(base + "/api/seller/me", headers={"Authorization": "Bearer " + token},
+        r = requests.get(base + "/api/seller/me", headers={"Authorization": "Bearer " + a["token"]},
                          timeout=20, verify=verify)
         data = r.json() if r.content else {}
     except Exception as e:
-        set_setting("api_status", "failed")
-        set_setting("api_info", str(e)[:200])
-        set_setting("api_checked", now())
-        return False, f"Connection failed: {e}"
+        info = f"Connection failed: {e}"[:200]
+        q("UPDATE api_accounts SET status='failed', info=?, checked=? WHERE id=?", (info, now(), a["id"]), commit=True)
+        return False, info
     ok = r.status_code == 200 and data.get("success", True) is not False
-    info = ""
     if ok:
         bal = None
         for src in (data, data.get("credits") if isinstance(data.get("credits"), dict) else {},
@@ -211,10 +261,27 @@ def test_api():
         info = f"Balance: {bal}" if bal is not None else "OK"
     else:
         info = f"{data.get('error', r.status_code)}: {data.get('message', '')}"[:200]
-    set_setting("api_status", "connected" if ok else "failed")
-    set_setting("api_info", info)
-    set_setting("api_checked", now())
+    q("UPDATE api_accounts SET status=?, info=?, checked=? WHERE id=?",
+      ("connected" if ok else "failed", info, now(), a["id"]), commit=True)
     return ok, info
+
+
+def test_all():
+    for a in accounts(False):
+        test_account(a)
+
+
+def migrate():
+    """Old single-token setting -> first API account."""
+    if q("SELECT COUNT(*) c FROM api_accounts", one=True)["c"] == 0:
+        tok = (get_setting("api_token") or "").strip()
+        if tok:
+            q("INSERT INTO api_accounts(name,token,base_url,enabled,status,info,checked,used) VALUES(?,?,?,?,?,?,?,?)",
+              ("Main", tok, "", 1, "unknown", "", 0, 0), commit=True)
+
+
+def bot_token():
+    return (get_setting("bot_token") or BOT_TOKEN or "").strip()
 
 
 # ------------------------------------------------------------------ telegram bot
@@ -223,7 +290,6 @@ LINE = "━━━━━━━━━━━━━━━━━━━━━━"
 KEY_RE = re.compile(r"^[A-Za-z0-9_\-]{6,80}$")
 _inflight = set()
 _inflight_lock = threading.Lock()
-esc = html.escape
 
 
 def tiers_block():
@@ -308,8 +374,9 @@ def h_admin(m):
     total = q("SELECT COUNT(*) c FROM users", one=True)["c"]
     ok = q("SELECT COUNT(*) c FROM resets WHERE status='success' AND ts>?", (t,), one=True)["c"]
     bad = q("SELECT COUNT(*) c FROM resets WHERE status!='success' AND ts>?", (t,), one=True)["c"]
-    st = get_setting("api_status")
-    ico = {"connected": "🟢 Connected", "failed": "🔴 Failed"}.get(st, "⚪ Not connected")
+    accs = accounts(False)
+    good = sum(1 for a in accs if a["status"] == "connected")
+    ico = f"🟢 {good}/{len(accs)} accounts connected" if good else f"⚪ {good}/{len(accs)} accounts connected"
     bot.send_message(m.chat.id,
                      f"🛠 <b>ADMIN</b>\n├ Users: {total}\n├ Resets 24h: ✅ {ok} / ❌ {bad}\n"
                      f"└ API: {ico}\n\n"
@@ -378,9 +445,9 @@ def h_key(m):
         _inflight.add(uid)
     try:
         wait = bot.reply_to(m, "⏳ <b>Processing...</b>")
-        status, msg = call_reset(key)
+        status, msg, acct = call_reset(key)
         q("INSERT INTO resets(user_id,license_key,status,message,ts) VALUES(?,?,?,?,?)",
-          (uid, key, status, msg[:300], now()), commit=True)
+          (uid, key, status, (msg[:260] + (f" [via {acct}]" if acct else "")), now()), commit=True)
         if status == "success":
             used += 1
             left = "Unlimited" if lim < 0 else str(max(0, lim - used))
@@ -517,14 +584,14 @@ def dashboard():
     )
     tiers = {x: c("SELECT COUNT(*) c FROM users WHERE tier=?", (x,)) for x in TIERS}
     logs = q("SELECT r.*, u.username FROM resets r LEFT JOIN users u ON u.id=r.user_id ORDER BY r.id DESC LIMIT 10")
-    api = dict(status=get_setting("api_status"), info=get_setting("api_info"),
-               checked=int(get_setting("api_checked") or 0))
+    accs = accounts(False)
+    api = dict(total=len(accs), good=sum(1 for a in accs if a["status"] == "connected"),
+               bad=sum(1 for a in accs if a["status"] == "failed"))
     body = """
     <div class="card"><h2>API Status</h2>
-      {% if api.status=='connected' %}<b class="ok">🟢 Connected</b> <span class="pill">{{api.info}}</span>
-      {% elif api.status=='failed' %}<b class="bad">🔴 Connection failed</b> <span class="pill">{{api.info}}</span>
-      {% else %}<b class="warn">⚪ Not connected</b> — set it in <a href="/api" style="color:var(--g)">API Settings</a>{% endif %}
-      <div style="color:var(--mu);margin-top:6px">Last checked: {{api.checked|ts}}</div></div>
+      {% if api.good %}<b class="ok">🟢 Connected</b> <span class="pill">{{api.good}}/{{api.total}} seller accounts</span>
+      {% elif api.total %}<b class="bad">🔴 Not connected</b> <span class="pill">{{api.total}} account(s) failing</span> — <a href="/api" style="color:var(--g)">check</a>
+      {% else %}<b class="warn">⚪ Not connected</b> — add a seller API account in <a href="/api" style="color:var(--g)">API Settings</a>{% endif %}</div>
     <div class="grid">
       <div class="stat"><small>Total users</small><b>{{st.total}}</b></div>
       <div class="stat"><small>New (24h)</small><b>{{st.new}}</b></div>
@@ -614,35 +681,116 @@ def users_update():
     return redirect(request.referrer or "/users")
 
 
-@app.route("/api", methods=["GET", "POST"])
+@app.route("/api")
 def api_settings():
-    if request.method == "POST":
-        base = request.form.get("base", "").strip().rstrip("/")
-        base = re.split(r"/api(/|$)", base)[0]  # user may paste the full endpoint
-        if base and not base.startswith("http"):
-            base = "https://" + base
-        set_setting("api_base_url", base)
-        tok = request.form.get("token", "").strip()
-        if tok:
-            set_setting("api_token", tok)
-        set_setting("verify_ssl", "1" if request.form.get("verify") else "0")
-        ok, info = test_api()
-        flash(("✅ Connected successfully — " if ok else "❌ Connection failed — ") + info, "ok" if ok else "error")
+    accs = accounts(False)
+    body = """
+    <div class="card"><h2>🌐 Server (shared by all seller accounts)</h2>
+    <form method="post" action="/api/server"><input type="hidden" name="_c" value="{{csrf()}}">
+    <div class="row"><div><label>API Base URL</label><input type="text" name="base" value="{{base}}" placeholder="https://140.245.202.76"></div></div>
+    <label style="display:inline"><input type="checkbox" name="verify" {{'checked' if verify}}> Verify SSL certificate (leave OFF for a raw IP / self-signed https)</label><br><br>
+    <button class="btn">Save &amp; Test all</button></form></div>
+
+    <div class="card"><h2>🔑 Seller API accounts ({{accs|length}})</h2>
+    <p style="color:var(--mu);margin-top:0">A key sent by a user is tried on <b>every enabled account</b> until one resets it —
+    so keys made by you, your friend, or any other seller all work as long as their token is added here.</p>
+    <div class="scroll"><table><tr><th>Name</th><th>Token</th><th>Status</th><th>Resets</th><th></th></tr>
+    {% for a in accs %}<tr><td><b>{{a.name}}</b>{% if a.base_url %}<br><small style="color:var(--mu)">{{a.base_url}}</small>{% endif %}</td>
+    <td><code>{{mask(a.token)}}</code></td>
+    <td>{% if not a.enabled %}<span class="pill">disabled</span>{% elif a.status=='connected' %}<b class="ok">🟢 Connected</b>
+    {% elif a.status=='failed' %}<b class="bad">🔴 Failed</b>{% else %}<span class="warn">⚪ Untested</span>{% endif %}
+    <br><small style="color:var(--mu)">{{a.info}}</small></td><td>{{a.used}}</td>
+    <td class="s" style="white-space:nowrap">
+    <form method="post" action="/api/account/{{a.id}}/test" style="display:inline"><input type="hidden" name="_c" value="{{csrf()}}"><button class="btn alt">Test</button></form>
+    <form method="post" action="/api/account/{{a.id}}/toggle" style="display:inline"><input type="hidden" name="_c" value="{{csrf()}}"><button class="btn alt">{{'Disable' if a.enabled else 'Enable'}}</button></form>
+    <form method="post" action="/api/account/{{a.id}}/delete" style="display:inline" onsubmit="return confirm('Delete this account?')"><input type="hidden" name="_c" value="{{csrf()}}"><button class="btn alt" style="color:var(--r)">Delete</button></form>
+    </td></tr>{% endfor %}</table></div>
+    <h2 style="margin-top:18px">➕ Add seller account</h2>
+    <form method="post" action="/api/account/add"><input type="hidden" name="_c" value="{{csrf()}}">
+    <div class="row"><div><label>Name (e.g. My dashboard, Friend 1)</label><input type="text" name="name" required></div>
+    <div><label>API Token</label><input type="password" name="token" placeholder="txr_..." required></div>
+    <div><label>Own Base URL (optional — blank = server above)</label><input type="text" name="base"></div></div>
+    <button class="btn">Add &amp; Test</button></form></div>
+
+    <div class="card"><h2>🤖 Telegram Bot Token</h2>
+    <p>Current: <code>{{bmask}}</code> {% if buser %}<span class="pill">@{{buser}}</span>{% endif %}</p>
+    <p style="color:var(--mu);margin-top:0">If the token ever leaks: revoke it in @BotFather (/revoke), paste the new one here. The bot switches instantly, no redeploy.</p>
+    <form method="post" action="/api/bot-token"><input type="hidden" name="_c" value="{{csrf()}}">
+    <div class="row"><div><label>New Bot Token</label><input type="password" name="token" placeholder="123456:ABC..." required></div></div>
+    <button class="btn">Verify &amp; Switch</button></form></div>"""
+    return page("API", "a", body, accs=accs, base=get_setting("api_base_url"), mask=mask,
+                verify=get_setting("verify_ssl") == "1", bmask=mask(bot_token()),
+                buser=get_setting("bot_username"))
+
+
+@app.route("/api/server", methods=["POST"])
+def api_server():
+    base = request.form.get("base", "").strip().rstrip("/")
+    base = re.split(r"/api(/|$)", base)[0]
+    if base and not base.startswith("http"):
+        base = "https://" + base
+    set_setting("api_base_url", base)
+    set_setting("verify_ssl", "1" if request.form.get("verify") else "0")
+    test_all()
+    flash("Server saved and all accounts tested", "ok")
+    return redirect("/api")
+
+
+@app.route("/api/account/add", methods=["POST"])
+def api_add():
+    name = request.form.get("name", "").strip()[:40] or "Account"
+    tok = request.form.get("token", "").strip()
+    base = request.form.get("base", "").strip().rstrip("/")
+    base = re.split(r"/api(/|$)", base)[0]
+    if base and not base.startswith("http"):
+        base = "https://" + base
+    if not tok:
+        flash("Token required", "error")
         return redirect("/api")
-    tok = get_setting("api_token")
-    masked = (tok[:8] + "…" + tok[-4:]) if len(tok) > 14 else ("•••" if tok else "")
-    body = """<div class="card"><h2>🔌 Reset API Connection</h2>
-    <p>Status: {% if st=='connected' %}<b class="ok">🟢 Connected</b> <span class="pill">{{info}}</span>
-    {% elif st=='failed' %}<b class="bad">🔴 Failed</b> <span class="pill">{{info}}</span>{% else %}<b class="warn">⚪ Not connected</b>{% endif %}</p>
-    <form method="post"><input type="hidden" name="_c" value="{{csrf()}}">
-    <div class="row"><div><label>API Base URL</label><input type="text" name="base" value="{{base}}" placeholder="https://140.245.202.76"></div>
-    <div><label>API Token (leave blank to keep current: {{masked or 'none'}})</label><input type="password" name="token" placeholder="txr_..."></div></div>
-    <label style="display:inline"><input type="checkbox" name="verify" {{'checked' if verify}}> Verify SSL certificate
-    (leave OFF for a raw IP / self-signed https)</label><br><br>
-    <button class="btn">Save &amp; Test Connection</button></form>
-    <p style="color:var(--mu)">Reset endpoint used: <code>POST {{base or 'BASE'}}/api/seller/reset-hwid</code> with <code>{"license_key": "..."}</code></p></div>"""
-    return page("API", "a", body, st=get_setting("api_status"), info=get_setting("api_info"),
-                base=get_setting("api_base_url"), masked=masked, verify=get_setting("verify_ssl") == "1")
+    q("INSERT INTO api_accounts(name,token,base_url,enabled,status,info,checked,used) VALUES(?,?,?,?,?,?,?,?)",
+      (name, tok, base, 1, "unknown", "", 0, 0), commit=True)
+    a = q("SELECT * FROM api_accounts ORDER BY id DESC LIMIT 1", one=True)
+    ok, info = test_account(a)
+    flash(("✅ Connected — " if ok else "❌ Added but connection failed — ") + info, "ok" if ok else "error")
+    return redirect("/api")
+
+
+@app.route("/api/account/<int:aid>/<act>", methods=["POST"])
+def api_account_act(aid, act):
+    a = q("SELECT * FROM api_accounts WHERE id=?", (aid,), one=True)
+    if not a:
+        return redirect("/api")
+    if act == "test":
+        ok, info = test_account(a)
+        flash(("✅ " if ok else "❌ ") + a["name"] + ": " + info, "ok" if ok else "error")
+    elif act == "toggle":
+        q("UPDATE api_accounts SET enabled=1-enabled WHERE id=?", (aid,), commit=True)
+    elif act == "delete":
+        q("DELETE FROM api_accounts WHERE id=?", (aid,), commit=True)
+        flash("Account deleted", "ok")
+    return redirect("/api")
+
+
+@app.route("/api/bot-token", methods=["POST"])
+def bot_token_save():
+    tok = request.form.get("token", "").strip()
+    try:
+        d = requests.get(f"https://api.telegram.org/bot{tok}/getMe", timeout=15).json()
+    except Exception as e:
+        flash(f"Could not reach Telegram: {e}", "error")
+        return redirect("/api")
+    if not d.get("ok"):
+        flash("❌ Telegram rejected this token — nothing changed", "error")
+        return redirect("/api")
+    set_setting("bot_token", tok)
+    set_setting("bot_username", d["result"].get("username", ""))
+    bot.token = tok
+    try:
+        bot.stop_polling()
+    except Exception:
+        pass
+    flash("✅ Bot switched to @" + d["result"].get("username", "?"), "ok")
+    return redirect("/api")
 
 
 @app.route("/limits", methods=["GET", "POST"])
@@ -692,22 +840,26 @@ def keepalive():
 def run_bot():
     while True:
         try:
+            bot.token = bot_token()
+            ev = getattr(bot, "_TeleBot__stop_polling", None)
+            if ev is not None:
+                ev.clear()
             bot.remove_webhook()
             log.info("Bot polling started")
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
         except Exception as e:
             log.error("polling crashed: %s", e)
-            time.sleep(5)
+        time.sleep(3)
 
 
 init_db()
+migrate()
 
 if __name__ == "__main__":
-    if not BOT_TOKEN:
+    if not bot_token():
         log.error("BOT_TOKEN is missing!")
     else:
         threading.Thread(target=run_bot, daemon=True).start()
     threading.Thread(target=keepalive, daemon=True).start()
-    if get_setting("api_base_url") and get_setting("api_token"):
-        threading.Thread(target=test_api, daemon=True).start()
+    threading.Thread(target=test_all, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, threaded=True)
